@@ -1,0 +1,37 @@
+### 3.3 Configure Application Properties
+
+
+
+server:
+  port: 8080
+  error:
+    include-message: always
+    include-binding-errors: always
+    include-stacktrace: always
+    include-exception: true
+
+spring:
+  thymeleaf:
+    cache: false
+    prefix: classpath:/templates/
+    suffix: .html
+    encoding: UTF-8
+    mode: HTML
+  cache:
+    type: caffeine
+    caffeine:
+      spec: maximumSize=1000,expireAfterWrite=300s
+
+api:
+  exchangerate:
+    base-url: https://api.exchangerate-api.com/v4
+    key: ${EXCHANGERATE_API_KEY:your-api-key-here}
+  openexchange:
+    base-url: https://openexchangerates.org/api
+    key: ${OPENEXCHANGE_API_KEY:f7e558fa5b59498a90be5ad60f3c9a10}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,cache
