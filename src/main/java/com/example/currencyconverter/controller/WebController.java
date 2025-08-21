@@ -26,7 +26,7 @@ public class WebController {
     
     // List of common currencies for the dropdown
     private final List<String> popularCurrencies = Arrays.asList(
-            "USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "CNY", "SEK", "NZD",
+            "USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "CNY", "SEK", "NZD", "NGN", "PLN",
             "MXN", "SGD", "HKD", "NOK", "KRW", "TRY", "RUB", "INR", "BRL", "ZAR"
     );
     
