@@ -30,31 +30,43 @@ public class CurrencyConversionService {
         
         try {
             // Try primary API first, fall back to secondary if needed
-            BigDecimal exchangeRate = getExchangeRateWithFallback(fromCurrency, toCurrency);
-            BigDecimal convertedAmount = amount.multiply(exchangeRate).setScale(2, RoundingMode.HALF_UP);
+            RateResponse rateResponse = getExchangeRateWithFallback(fromCurrency, toCurrency);
+            BigDecimal convertedAmount = amount.multiply(rateResponse.rate).setScale(2, RoundingMode.HALF_UP);
             
-            return createResponse(amount, fromCurrency, toCurrency, exchangeRate, convertedAmount, "API");
+            return createResponse(amount, fromCurrency, toCurrency, rateResponse.rate, convertedAmount, rateResponse.provider);
         } catch (Exception e) {
             log.error("All currency conversion attempts failed", e);
             throw new CurrencyConversionException("Unable to convert currency: " + e.getMessage());
         }
     }
     
+    private static class RateResponse {
+        final BigDecimal rate;
+        final String provider;
+        
+        RateResponse(BigDecimal rate, String provider) {
+            this.rate = rate;
+            this.provider = provider;
+        }
+    }
+
     @Cacheable(value = "exchangeRates", key = "#fromCurrency + '-' + #toCurrency")
-    public BigDecimal getExchangeRateWithFallback(String fromCurrency, String toCurrency) {
+    public RateResponse getExchangeRateWithFallback(String fromCurrency, String toCurrency) {
         log.info("Getting exchange rate with fallback: {} to {}", fromCurrency, toCurrency);
         
         // Try primary API first
         try {
-            return exchangeRateApiClient.getExchangeRate(fromCurrency, toCurrency)
+            BigDecimal rate = exchangeRateApiClient.getExchangeRate(fromCurrency, toCurrency)
                     .block();
+            return new RateResponse(rate, "ExchangeRate-API");
         } catch (Exception e) {
             log.warn("Primary API (ExchangeRate-API) failed, trying fallback", e);
             
             // Try secondary API
             try {
-                return openExchangeRatesClient.getExchangeRate(fromCurrency, toCurrency)
-                        .block();
+                BigDecimal rate = openExchangeRatesClient.getExchangeRate(fromCurrency, toCurrency)
+                    .block();
+                return new RateResponse(rate, "OpenExchangeRates");
             } catch (Exception fallbackError) {
                 log.error("Fallback API (OpenExchangeRates) also failed", fallbackError);
                 throw new CurrencyConversionException("Both primary and fallback APIs failed");
@@ -73,29 +85,31 @@ public class CurrencyConversionService {
         }
         
         // Call both APIs in parallel
-        CompletableFuture<BigDecimal> primaryCall = exchangeRateApiClient
+        CompletableFuture<RateResponse> primaryCall = exchangeRateApiClient
                 .getExchangeRate(fromCurrency, toCurrency)
+                .map(rate -> new RateResponse(rate, "ExchangeRate-API"))
                 .toFuture();
                 
-        CompletableFuture<BigDecimal> fallbackCall = openExchangeRatesClient
+        CompletableFuture<RateResponse> fallbackCall = openExchangeRatesClient
                 .getExchangeRate(fromCurrency, toCurrency)
+                .map(rate -> new RateResponse(rate, "OpenExchangeRates"))
                 .toFuture();
         
         // Use the first successful result
         return primaryCall
-                .handle((rate, throwable) -> {
+                .handle((rateResponse, throwable) -> {
                     if (throwable == null) {
-                        return CompletableFuture.completedFuture(rate);
+                        return CompletableFuture.completedFuture(rateResponse);
                     } else {
                         log.warn("Primary API failed, using fallback", throwable);
                         return fallbackCall;
                     }
                 })
                 .thenCompose(future -> future)
-                .thenApply(exchangeRate -> {
-                    BigDecimal convertedAmount = amount.multiply(exchangeRate)
+                .thenApply(rateResponse -> {
+                    BigDecimal convertedAmount = amount.multiply(rateResponse.rate)
                             .setScale(2, RoundingMode.HALF_UP);
-                    return createResponse(amount, fromCurrency, toCurrency, exchangeRate, convertedAmount, "API");
+                    return createResponse(amount, fromCurrency, toCurrency, rateResponse.rate, convertedAmount, rateResponse.provider);
                 })
                 .exceptionally(throwable -> {
                     log.error("All async conversion attempts failed", throwable);
