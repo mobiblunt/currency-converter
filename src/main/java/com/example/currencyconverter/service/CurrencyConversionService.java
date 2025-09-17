@@ -13,7 +13,17 @@ import reactor.core.publisher.Mono;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.TreeMap;
+import java.util.Map;
+import java.util.List;
+import java.util.Arrays;
+import java.util.HashMap;
+
+import com.example.currencyconverter.dto.ExchangeRateHistory;
+import org.springframework.scheduling.annotation.Scheduled;
 
 @Slf4j
 @Service
@@ -22,6 +32,14 @@ public class CurrencyConversionService {
     
     private final ExchangeRateApiClient exchangeRateApiClient;
     private final OpenExchangeRatesClient openExchangeRatesClient;
+    
+    // Store rate history for the last 24 hours: Map<BaseCurrency, Map<Timestamp, Map<TargetCurrency, Rate>>>
+    private final Map<String, Map<LocalDateTime, Map<String, BigDecimal>>> rateHistory = new ConcurrentHashMap<>();
+    
+    private final List<String> popularCurrencies = Arrays.asList(
+        "USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "CNY", "SEK", "NZD",
+        "MXN", "SGD", "HKD", "NOK", "KRW", "TRY", "RUB", "INR", "BRL", "ZAR"
+    );
     
     public CurrencyConversionResponse convertCurrency(BigDecimal amount, String fromCurrency, String toCurrency) {
         if (fromCurrency.equals(toCurrency)) {
@@ -52,25 +70,45 @@ public class CurrencyConversionService {
 
     @Cacheable(value = "exchangeRates", key = "#fromCurrency + '-' + #toCurrency")
     public RateResponse getExchangeRateWithFallback(String fromCurrency, String toCurrency) {
-        log.info("Getting exchange rate with fallback: {} to {}", fromCurrency, toCurrency);
+        log.info("Getting exchange rates from multiple APIs: {} to {}", fromCurrency, toCurrency);
         
-        // Try primary API first
+        BigDecimal exchangeRateApiRate = null;
+        BigDecimal openExchangeRate = null;
+        
+        // Try ExchangeRate API
         try {
-            BigDecimal rate = exchangeRateApiClient.getExchangeRate(fromCurrency, toCurrency)
+            exchangeRateApiRate = exchangeRateApiClient.getExchangeRate(fromCurrency, toCurrency)
                     .block();
-            return new RateResponse(rate, "ExchangeRate-API");
+            log.info("ExchangeRate-API rate: {}", exchangeRateApiRate);
         } catch (Exception e) {
-            log.warn("Primary API (ExchangeRate-API) failed, trying fallback", e);
-            
-            // Try secondary API
-            try {
-                BigDecimal rate = openExchangeRatesClient.getExchangeRate(fromCurrency, toCurrency)
+            log.warn("ExchangeRate-API failed", e);
+        }
+        
+        // Try OpenExchange API
+        try {
+            openExchangeRate = openExchangeRatesClient.getExchangeRate(fromCurrency, toCurrency)
                     .block();
-                return new RateResponse(rate, "OpenExchangeRates");
-            } catch (Exception fallbackError) {
-                log.error("Fallback API (OpenExchangeRates) also failed", fallbackError);
-                throw new CurrencyConversionException("Both primary and fallback APIs failed");
-            }
+            log.info("OpenExchangeRates rate: {}", openExchangeRate);
+        } catch (Exception e) {
+            log.warn("OpenExchangeRates failed", e);
+        }
+        
+        // Determine final rate and provider
+        if (exchangeRateApiRate != null && openExchangeRate != null) {
+            // Calculate average if both APIs returned data
+            BigDecimal averageRate = exchangeRateApiRate.add(openExchangeRate)
+                    .divide(BigDecimal.valueOf(2), 6, RoundingMode.HALF_UP);
+            log.info("Using average rate from both APIs: {}", averageRate);
+            return new RateResponse(averageRate, "Average (ExchangeRate-API + OpenExchangeRates)");
+        } else if (exchangeRateApiRate != null) {
+            // Use ExchangeRate API rate
+            return new RateResponse(exchangeRateApiRate, "ExchangeRate-API");
+        } else if (openExchangeRate != null) {
+            // Use OpenExchange rate
+            return new RateResponse(openExchangeRate, "OpenExchangeRates");
+        } else {
+            // Both APIs failed
+            throw new CurrencyConversionException("Both APIs failed to provide exchange rates");
         }
     }
     
@@ -85,27 +123,47 @@ public class CurrencyConversionService {
         }
         
         // Call both APIs in parallel
-        CompletableFuture<RateResponse> primaryCall = exchangeRateApiClient
+        CompletableFuture<BigDecimal> exchangeRateApiFuture = exchangeRateApiClient
                 .getExchangeRate(fromCurrency, toCurrency)
-                .map(rate -> new RateResponse(rate, "ExchangeRate-API"))
-                .toFuture();
+                .toFuture()
+                .handle((rate, error) -> {
+                    if (error != null) {
+                        log.warn("ExchangeRate-API failed", error);
+                        return null;
+                    }
+                    return rate;
+                });
                 
-        CompletableFuture<RateResponse> fallbackCall = openExchangeRatesClient
+        CompletableFuture<BigDecimal> openExchangeFuture = openExchangeRatesClient
                 .getExchangeRate(fromCurrency, toCurrency)
-                .map(rate -> new RateResponse(rate, "OpenExchangeRates"))
-                .toFuture();
+                .toFuture()
+                .handle((rate, error) -> {
+                    if (error != null) {
+                        log.warn("OpenExchangeRates failed", error);
+                        return null;
+                    }
+                    return rate;
+                });
         
-        // Use the first successful result
-        return primaryCall
-                .handle((rateResponse, throwable) -> {
-                    if (throwable == null) {
-                        return CompletableFuture.completedFuture(rateResponse);
+        // Wait for both results
+        return CompletableFuture.allOf(exchangeRateApiFuture, openExchangeFuture)
+                .thenApply(v -> {
+                    BigDecimal exchangeRateApiRate = exchangeRateApiFuture.join();
+                    BigDecimal openExchangeRate = openExchangeFuture.join();
+                    
+                    if (exchangeRateApiRate != null && openExchangeRate != null) {
+                        // Calculate average if both APIs returned data
+                        BigDecimal averageRate = exchangeRateApiRate.add(openExchangeRate)
+                                .divide(BigDecimal.valueOf(2), 6, RoundingMode.HALF_UP);
+                        return new RateResponse(averageRate, "Average (ExchangeRate-API + OpenExchangeRates)");
+                    } else if (exchangeRateApiRate != null) {
+                        return new RateResponse(exchangeRateApiRate, "ExchangeRate-API");
+                    } else if (openExchangeRate != null) {
+                        return new RateResponse(openExchangeRate, "OpenExchangeRates");
                     } else {
-                        log.warn("Primary API failed, using fallback", throwable);
-                        return fallbackCall;
+                        throw new CurrencyConversionException("Both APIs failed to provide exchange rates");
                     }
                 })
-                .thenCompose(future -> future)
                 .thenApply(rateResponse -> {
                     BigDecimal convertedAmount = amount.multiply(rateResponse.rate)
                             .setScale(2, RoundingMode.HALF_UP);
@@ -115,6 +173,65 @@ public class CurrencyConversionService {
                     log.error("All async conversion attempts failed", throwable);
                     throw new CurrencyConversionException("Unable to convert currency: " + throwable.getMessage());
                 });
+    }
+    
+    @Scheduled(fixedRate = 3600000) // Run every hour
+    public void updateRateHistory() {
+        log.info("Updating rate history");
+        LocalDateTime now = LocalDateTime.now();
+        
+        for (String baseCurrency : popularCurrencies) {
+            try {
+                // Get current rates for the base currency
+                RateResponse rateResponse = getExchangeRateWithFallback(baseCurrency, "USD"); // Using USD as reference
+                Map<String, BigDecimal> currentRates = new HashMap<>();
+                
+                for (String targetCurrency : popularCurrencies) {
+                    if (!targetCurrency.equals(baseCurrency)) {
+                        try {
+                            RateResponse targetResponse = getExchangeRateWithFallback(baseCurrency, targetCurrency);
+                            currentRates.put(targetCurrency, targetResponse.rate);
+                        } catch (Exception e) {
+                            log.warn("Failed to get rate for {}/{}", baseCurrency, targetCurrency, e);
+                        }
+                    }
+                }
+                
+                // Update history
+                rateHistory.computeIfAbsent(baseCurrency, k -> new ConcurrentHashMap<>())
+                          .put(now, currentRates);
+                
+                // Remove entries older than 24 hours
+                removeOldEntries(baseCurrency);
+                
+            } catch (Exception e) {
+                log.error("Failed to update rate history for {}", baseCurrency, e);
+            }
+        }
+    }
+    
+    private void removeOldEntries(String baseCurrency) {
+        LocalDateTime cutoff = LocalDateTime.now().minus(24, ChronoUnit.HOURS);
+        Map<LocalDateTime, Map<String, BigDecimal>> currencyHistory = rateHistory.get(baseCurrency);
+        if (currencyHistory != null) {
+            currencyHistory.keySet().removeIf(timestamp -> timestamp.isBefore(cutoff));
+        }
+    }
+    
+    public ExchangeRateHistory getRateHistory(String baseCurrency) {
+        Map<LocalDateTime, Map<String, BigDecimal>> history = rateHistory.get(baseCurrency);
+        if (history == null || history.isEmpty()) {
+            throw new CurrencyConversionException("No rate history available for " + baseCurrency);
+        }
+        
+        // Sort by timestamp
+        TreeMap<LocalDateTime, Map<String, BigDecimal>> sortedHistory = new TreeMap<>(history);
+        
+        return new ExchangeRateHistory(
+            baseCurrency,
+            LocalDateTime.now(),
+            sortedHistory
+        );
     }
     
     private CurrencyConversionResponse createResponse(BigDecimal amount, String fromCurrency, 
