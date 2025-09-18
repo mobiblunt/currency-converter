@@ -8,7 +8,6 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
-import reactor.core.publisher.Mono;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -19,11 +18,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.TreeMap;
 import java.util.Map;
 import java.util.List;
-import java.util.Arrays;
-import java.util.HashMap;
+import java.util.ArrayList;
 
 import com.example.currencyconverter.dto.ExchangeRateHistory;
-import org.springframework.scheduling.annotation.Scheduled;
 
 @Slf4j
 @Service
@@ -33,13 +30,10 @@ public class CurrencyConversionService {
     private final ExchangeRateApiClient exchangeRateApiClient;
     private final OpenExchangeRatesClient openExchangeRatesClient;
     
-    // Store rate history for the last 24 hours: Map<BaseCurrency, Map<Timestamp, Map<TargetCurrency, Rate>>>
-    private final Map<String, Map<LocalDateTime, Map<String, BigDecimal>>> rateHistory = new ConcurrentHashMap<>();
+    // Store conversion history: Map<CurrencyPair, Map<Timestamp, Rate>>
+    private final Map<String, Map<LocalDateTime, BigDecimal>> conversionHistory = new ConcurrentHashMap<>();
+
     
-    private final List<String> popularCurrencies = Arrays.asList(
-        "USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "CNY", "SEK", "NZD",
-        "MXN", "SGD", "HKD", "NOK", "KRW", "TRY", "RUB", "INR", "BRL", "ZAR"
-    );
     
     public CurrencyConversionResponse convertCurrency(BigDecimal amount, String fromCurrency, String toCurrency) {
         if (fromCurrency.equals(toCurrency)) {
@@ -47,13 +41,16 @@ public class CurrencyConversionService {
         }
         
         try {
-            // Try primary API first, fall back to secondary if needed
+            // Get exchange rate with fallback
             RateResponse rateResponse = getExchangeRateWithFallback(fromCurrency, toCurrency);
             BigDecimal convertedAmount = amount.multiply(rateResponse.rate).setScale(2, RoundingMode.HALF_UP);
             
+            // Store the rate in history
+            storeConversionRate(fromCurrency, toCurrency, rateResponse.rate);
+            
             return createResponse(amount, fromCurrency, toCurrency, rateResponse.rate, convertedAmount, rateResponse.provider);
         } catch (Exception e) {
-            log.error("All currency conversion attempts failed", e);
+            log.error("Currency conversion failed for {} {} to {}: {}", amount, fromCurrency, toCurrency, e.getMessage());
             throw new CurrencyConversionException("Unable to convert currency: " + e.getMessage());
         }
     }
@@ -70,7 +67,7 @@ public class CurrencyConversionService {
 
     @Cacheable(value = "exchangeRates", key = "#fromCurrency + '-' + #toCurrency")
     public RateResponse getExchangeRateWithFallback(String fromCurrency, String toCurrency) {
-        log.info("Getting exchange rates from multiple APIs: {} to {}", fromCurrency, toCurrency);
+        log.info("Getting exchange rates from APIs: {} to {}", fromCurrency, toCurrency);
         
         BigDecimal exchangeRateApiRate = null;
         BigDecimal openExchangeRate = null;
@@ -79,18 +76,18 @@ public class CurrencyConversionService {
         try {
             exchangeRateApiRate = exchangeRateApiClient.getExchangeRate(fromCurrency, toCurrency)
                     .block();
-            log.info("ExchangeRate-API rate: {}", exchangeRateApiRate);
+            log.debug("ExchangeRate-API rate: {}", exchangeRateApiRate);
         } catch (Exception e) {
-            log.warn("ExchangeRate-API failed", e);
+            log.warn("ExchangeRate-API failed for {}/{}: {}", fromCurrency, toCurrency, e.getMessage());
         }
         
         // Try OpenExchange API
         try {
             openExchangeRate = openExchangeRatesClient.getExchangeRate(fromCurrency, toCurrency)
                     .block();
-            log.info("OpenExchangeRates rate: {}", openExchangeRate);
+            log.debug("OpenExchangeRates rate: {}", openExchangeRate);
         } catch (Exception e) {
-            log.warn("OpenExchangeRates failed", e);
+            log.warn("OpenExchangeRates failed for {}/{}: {}", fromCurrency, toCurrency, e.getMessage());
         }
         
         // Determine final rate and provider
@@ -98,17 +95,14 @@ public class CurrencyConversionService {
             // Calculate average if both APIs returned data
             BigDecimal averageRate = exchangeRateApiRate.add(openExchangeRate)
                     .divide(BigDecimal.valueOf(2), 6, RoundingMode.HALF_UP);
-            log.info("Using average rate from both APIs: {}", averageRate);
+            log.info("Using average rate for {}/{}: {}", fromCurrency, toCurrency, averageRate);
             return new RateResponse(averageRate, "Average (ExchangeRate-API + OpenExchangeRates)");
         } else if (exchangeRateApiRate != null) {
-            // Use ExchangeRate API rate
             return new RateResponse(exchangeRateApiRate, "ExchangeRate-API");
         } else if (openExchangeRate != null) {
-            // Use OpenExchange rate
             return new RateResponse(openExchangeRate, "OpenExchangeRates");
         } else {
-            // Both APIs failed
-            throw new CurrencyConversionException("Both APIs failed to provide exchange rates");
+            throw new CurrencyConversionException("Both APIs failed to provide exchange rates for " + fromCurrency + "/" + toCurrency);
         }
     }
     
@@ -128,7 +122,7 @@ public class CurrencyConversionService {
                 .toFuture()
                 .handle((rate, error) -> {
                     if (error != null) {
-                        log.warn("ExchangeRate-API failed", error);
+                        log.warn("ExchangeRate-API failed for {}/{}: {}", fromCurrency, toCurrency, error.getMessage());
                         return null;
                     }
                     return rate;
@@ -139,7 +133,7 @@ public class CurrencyConversionService {
                 .toFuture()
                 .handle((rate, error) -> {
                     if (error != null) {
-                        log.warn("OpenExchangeRates failed", error);
+                        log.warn("OpenExchangeRates failed for {}/{}: {}", fromCurrency, toCurrency, error.getMessage());
                         return null;
                     }
                     return rate;
@@ -161,77 +155,140 @@ public class CurrencyConversionService {
                     } else if (openExchangeRate != null) {
                         return new RateResponse(openExchangeRate, "OpenExchangeRates");
                     } else {
-                        throw new CurrencyConversionException("Both APIs failed to provide exchange rates");
+                        throw new CurrencyConversionException("Both APIs failed to provide exchange rates for " + fromCurrency + "/" + toCurrency);
                     }
                 })
                 .thenApply(rateResponse -> {
                     BigDecimal convertedAmount = amount.multiply(rateResponse.rate)
                             .setScale(2, RoundingMode.HALF_UP);
+                    
+                    // Store the rate in history
+                    storeConversionRate(fromCurrency, toCurrency, rateResponse.rate);
+                    
                     return createResponse(amount, fromCurrency, toCurrency, rateResponse.rate, convertedAmount, rateResponse.provider);
                 })
                 .exceptionally(throwable -> {
-                    log.error("All async conversion attempts failed", throwable);
+                    log.error("Async conversion failed for {} {} to {}: {}", amount, fromCurrency, toCurrency, throwable.getMessage());
                     throw new CurrencyConversionException("Unable to convert currency: " + throwable.getMessage());
                 });
     }
     
-    @Scheduled(fixedRate = 3600000) // Run every hour
-    public void updateRateHistory() {
-        log.info("Updating rate history");
+    /**
+     * Store conversion rate in history for the given currency pair
+     */
+    private void storeConversionRate(String fromCurrency, String toCurrency, BigDecimal rate) {
+        String currencyPair = fromCurrency.toUpperCase() + "/" + toCurrency.toUpperCase();
         LocalDateTime now = LocalDateTime.now();
         
-        for (String baseCurrency : popularCurrencies) {
-            try {
-                // Get current rates for the base currency
-                RateResponse rateResponse = getExchangeRateWithFallback(baseCurrency, "USD"); // Using USD as reference
-                Map<String, BigDecimal> currentRates = new HashMap<>();
-                
-                for (String targetCurrency : popularCurrencies) {
-                    if (!targetCurrency.equals(baseCurrency)) {
-                        try {
-                            RateResponse targetResponse = getExchangeRateWithFallback(baseCurrency, targetCurrency);
-                            currentRates.put(targetCurrency, targetResponse.rate);
-                        } catch (Exception e) {
-                            log.warn("Failed to get rate for {}/{}", baseCurrency, targetCurrency, e);
-                        }
-                    }
-                }
-                
-                // Update history
-                rateHistory.computeIfAbsent(baseCurrency, k -> new ConcurrentHashMap<>())
-                          .put(now, currentRates);
-                
-                // Remove entries older than 24 hours
-                removeOldEntries(baseCurrency);
-                
-            } catch (Exception e) {
-                log.error("Failed to update rate history for {}", baseCurrency, e);
+        // Store the rate with timestamp
+        conversionHistory.computeIfAbsent(currencyPair, k -> new ConcurrentHashMap<>())
+                        .put(now, rate);
+        
+        // Clean up old entries (older than 24 hours)
+        removeOldEntries(currencyPair);
+        
+        log.debug("Stored conversion rate for {}: {} at {}", currencyPair, rate, now);
+    }
+    
+    /**
+     * Remove entries older than 24 hours for a currency pair
+     */
+    private void removeOldEntries(String currencyPair) {
+        LocalDateTime cutoff = LocalDateTime.now().minus(24, ChronoUnit.HOURS);
+        Map<LocalDateTime, BigDecimal> pairHistory = conversionHistory.get(currencyPair);
+        
+        if (pairHistory != null) {
+            int sizeBefore = pairHistory.size();
+            pairHistory.keySet().removeIf(timestamp -> timestamp.isBefore(cutoff));
+            int sizeAfter = pairHistory.size();
+            
+            if (sizeBefore > sizeAfter) {
+                log.debug("Removed {} old entries for {}", (sizeBefore - sizeAfter), currencyPair);
             }
         }
     }
     
-    private void removeOldEntries(String baseCurrency) {
-        LocalDateTime cutoff = LocalDateTime.now().minus(24, ChronoUnit.HOURS);
-        Map<LocalDateTime, Map<String, BigDecimal>> currencyHistory = rateHistory.get(baseCurrency);
-        if (currencyHistory != null) {
-            currencyHistory.keySet().removeIf(timestamp -> timestamp.isBefore(cutoff));
-        }
-    }
-    
+    /**
+     * Get rate history for a base currency
+     * Returns all conversion pairs where the base currency was used
+     */
     public ExchangeRateHistory getRateHistory(String baseCurrency) {
-        Map<LocalDateTime, Map<String, BigDecimal>> history = rateHistory.get(baseCurrency);
-        if (history == null || history.isEmpty()) {
-            throw new CurrencyConversionException("No rate history available for " + baseCurrency);
+        String upperBaseCurrency = baseCurrency.toUpperCase();
+        
+        // Find all currency pairs that start with the base currency
+        Map<LocalDateTime, Map<String, BigDecimal>> consolidatedHistory = new TreeMap<>();
+        
+        conversionHistory.entrySet().stream()
+                .filter(entry -> entry.getKey().startsWith(upperBaseCurrency + "/"))
+                .forEach(entry -> {
+                    String currencyPair = entry.getKey();
+                    String targetCurrency = currencyPair.substring(currencyPair.indexOf("/") + 1);
+                    Map<LocalDateTime, BigDecimal> pairHistory = entry.getValue();
+                    
+                    // Add each rate to the consolidated history
+                    pairHistory.forEach((timestamp, rate) -> {
+                        consolidatedHistory.computeIfAbsent(timestamp, k -> new ConcurrentHashMap<>())
+                                         .put(targetCurrency, rate);
+                    });
+                });
+        
+        if (consolidatedHistory.isEmpty()) {
+            log.warn("No conversion history available for base currency: {}", upperBaseCurrency);
+            throw new CurrencyConversionException("No conversion history available for " + upperBaseCurrency);
         }
         
-        // Sort by timestamp
-        TreeMap<LocalDateTime, Map<String, BigDecimal>> sortedHistory = new TreeMap<>(history);
+        log.info("Retrieved conversion history for {} with {} time points", upperBaseCurrency, consolidatedHistory.size());
         
         return new ExchangeRateHistory(
-            baseCurrency,
+            upperBaseCurrency,
             LocalDateTime.now(),
-            sortedHistory
+            new TreeMap<>(consolidatedHistory)
         );
+    }
+    
+    /**
+     * Get all currency pairs that have been converted
+     */
+    public List<String> getAvailableCurrencyPairs() {
+        return new ArrayList<>(conversionHistory.keySet());
+    }
+    
+    /**
+     * Get all base currencies that have conversion history
+     */
+    public List<String> getAvailableBaseCurrencies() {
+        return conversionHistory.keySet().stream()
+                .map(pair -> pair.substring(0, pair.indexOf("/")))
+                .distinct()
+                .sorted()
+                .toList();
+    }
+    
+    /**
+     * Get the latest rate for a specific currency pair
+     */
+    public BigDecimal getLatestRate(String fromCurrency, String toCurrency) {
+        String currencyPair = fromCurrency.toUpperCase() + "/" + toCurrency.toUpperCase();
+        Map<LocalDateTime, BigDecimal> pairHistory = conversionHistory.get(currencyPair);
+        
+        if (pairHistory == null || pairHistory.isEmpty()) {
+            throw new CurrencyConversionException("No conversion history available for " + currencyPair);
+        }
+        
+        // Get the most recent rate
+        LocalDateTime latestTimestamp = pairHistory.keySet().stream()
+                .max(LocalDateTime::compareTo)
+                .orElseThrow(() -> new CurrencyConversionException("No rates available for " + currencyPair));
+        
+        return pairHistory.get(latestTimestamp);
+    }
+    
+    /**
+     * Clear all conversion history (useful for testing)
+     */
+    public void clearHistory() {
+        conversionHistory.clear();
+        log.info("Cleared all conversion history");
     }
     
     private CurrencyConversionResponse createResponse(BigDecimal amount, String fromCurrency, 
